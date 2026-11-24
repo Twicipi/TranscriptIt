@@ -73,7 +73,7 @@ MODEL_OPTIONS = [
     ("large-v3-turbo", "large-v3-turbo (~4 GB VRAM) - Rekomendasi Utama GPU >= 4GB"),
     ("turbo", "turbo (~4 GB VRAM) - Cepat & Akurasi Tinggi"),
     ("large-v3", "large-v3 (~10 GB VRAM) - Kualitas Maksimal"),
-    ("gemini-1.5-flash", "Google Gemini Flash Audio (gemini-3.8-flash) - Direkomendasikan"),
+    ("gemini-4-hydrogen", "Google Gemini 4 Hydrogen Audio - Direkomendasikan"),
 ]
 
 
@@ -865,7 +865,7 @@ class TranskriptorApp(ctk.CTk):
         chunk_min: int = params["chunk_size_min"]
 
         try:
-            if model_name == "gemini-1.5-flash":
+            if model_name == "gemini-4-hydrogen":
                 self.msg_queue.put(("STATUS", "Mengunggah media ke Google Gemini..."))
                 result = transcribe_media_gemini(
                     file_path=file_path,

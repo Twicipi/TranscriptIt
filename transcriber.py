@@ -52,7 +52,7 @@ MODEL_VRAM_ESTIMATES: Dict[str, float] = {
 # Overlap antar-chunk (detik) untuk mencegah kata terpotong di batas chunk
 CHUNK_OVERLAP_SEC: float = 2.0
 
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-4-hydrogen")
 CUDA_DLL_HANDLES: List[Any] = []
 
 

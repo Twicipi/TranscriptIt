@@ -65,7 +65,7 @@ pip install -r requirements.txt
 
 ### Transkripsi Google Gemini Audio
 
-GUI juga menyediakan pilihan **Google Gemini Flash Audio**. Model ini mengunggah media ke Google AI dan membutuhkan API key, tetapi tidak memakai VRAM lokal.
+GUI juga menyediakan pilihan **Google Gemini 4 Hydrogen Audio**. Model ini mengunggah media ke Google AI dan membutuhkan API key, tetapi tidak memakai VRAM lokal.
 
 1. Buat API key di [Google AI Studio](https://aistudio.google.com/apikey).
 2. Pilih model Gemini pada dropdown GUI.
@@ -79,7 +79,7 @@ GUI juga menyediakan pilihan **Google Gemini Flash Audio**. Model ini mengunggah
    pip install google-genai
    ```
 
-Catatan: model Gemini dapat berubah sesuai endpoint API. Aplikasi kini memakai `gemini-3.8-flash` sebagai default sesuai rekomendasi respons API. Ketersediaan model dan kuota gratis tetap mengikuti akun Google AI/API saat ini; model dapat diganti melalui environment variable `GEMINI_MODEL`.
+Catatan: aplikasi menggunakan `gemini-4-hydrogen` sebagai default. Model ini mendukung input audio; ketersediaan dan kuota tetap mengikuti akun Google AI/API, jadi pergantian model tidak menjamin pesan high demand tidak muncul. Model dapat diganti melalui environment variable `GEMINI_MODEL`.
 
 #### Membedakan Pembicara
 
@@ -87,7 +87,7 @@ Untuk Gemini, salin `.example.env` menjadi `.env`, lalu isi nama pembicara:
 
 ```env
 GEMINI_API_KEY=API_KEY_ANDA
-GEMINI_MODEL=gemini-3.8-flash
+GEMINI_MODEL=gemini-4-hydrogen
 SPEAKER_A_NAME=Nama Pembicara A
 SPEAKER_B_NAME=Nama Pembicara B
 ```
