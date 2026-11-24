@@ -727,15 +727,17 @@ class TranskriptorApp(ctk.CTk):
 
     # EVENT HANDLERS & LOGIC
     def _check_system_hardware(self):
-        self.lbl_hw_badge.configure(text="Mendeteksi perangkat...", text_color=self.colors["muted"])
+        self.lbl_hw_badge.configure(
+            text="Perangkat akan dideteksi saat mulai",
+            text_color=self.colors["muted"],
+        )
 
         def worker():
             try:
                 ffmpeg_ok, ffmpeg_msg = check_ffmpeg_installed()
-                device, fp16, desc = detect_optimal_device(requested_device="auto")
-                self.msg_queue.put(("HARDWARE_CHECKED", (ffmpeg_ok, ffmpeg_msg, device, desc)))
+                self.msg_queue.put(("STARTUP_CHECKED", (ffmpeg_ok, ffmpeg_msg)))
             except Exception as exc:
-                self.msg_queue.put(("HARDWARE_CHECK_ERR", str(exc)))
+                self.msg_queue.put(("STARTUP_CHECK_ERR", str(exc)))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -970,29 +972,22 @@ class TranskriptorApp(ctk.CTk):
                         text_color=self.colors["danger"],
                     )
 
-                elif event == "HARDWARE_CHECKED":
-                    ffmpeg_ok, ffmpeg_msg, device, desc = data
+                elif event == "STARTUP_CHECKED":
+                    ffmpeg_ok, ffmpeg_msg = data
                     if not ffmpeg_ok:
                         self._log_system(f"PERINGATAN: FFmpeg tidak terdeteksi!\n{ffmpeg_msg}")
                         messagebox.showwarning("FFmpeg Diperlukan", ffmpeg_msg)
                     else:
                         self._log_system("FFmpeg & FFprobe terdeteksi dan siap digunakan.")
-
-                    if device == "cuda":
-                        badge_text = f"⚡ {desc}"
-                        badge_fg = self.colors["success"]
-                        badge_bg = self.colors["success_bg"]
-                    else:
-                        badge_text = f"💻 {desc}"
-                        badge_fg = self.colors["muted"]
-                        badge_bg = self.colors["surface"]
-
-                    self.lbl_hw_badge.configure(text=badge_text, fg_color=badge_bg, text_color=badge_fg)
-                    self._log_system(f"Perangkat Komputasi Aktif: {desc}")
-
-                elif event == "HARDWARE_CHECK_ERR":
                     self.lbl_hw_badge.configure(
-                        text="Perangkat belum terdeteksi",
+                        text="Perangkat siap; GPU dideteksi saat mulai",
+                        fg_color=self.colors["surface"],
+                        text_color=self.colors["muted"],
+                    )
+
+                elif event == "STARTUP_CHECK_ERR":
+                    self.lbl_hw_badge.configure(
+                        text="Pemeriksaan startup gagal",
                         fg_color=self.colors["surface"],
                         text_color=self.colors["warning"],
                     )
