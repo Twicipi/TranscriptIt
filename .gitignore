@@ -21,6 +21,8 @@ hasil_transkripsi/
 *.ogg
 *.aac
 *.srt
+*.txt
+!requirements.txt
 ffmpeg.exe
 =1.1.0
 =5.2.2
