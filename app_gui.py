@@ -727,25 +727,17 @@ class TranskriptorApp(ctk.CTk):
 
     # EVENT HANDLERS & LOGIC
     def _check_system_hardware(self):
-        ffmpeg_ok, ffmpeg_msg = check_ffmpeg_installed()
-        if not ffmpeg_ok:
-            self._log_system(f"PERINGATAN: FFmpeg tidak terdeteksi!\n{ffmpeg_msg}")
-            messagebox.showwarning("FFmpeg Diperlukan", ffmpeg_msg)
-        else:
-            self._log_system("FFmpeg & FFprobe terdeteksi dan siap digunakan.")
+        self.lbl_hw_badge.configure(text="Mendeteksi perangkat...", text_color=self.colors["muted"])
 
-        device, fp16, desc = detect_optimal_device(requested_device="auto")
-        if device == "cuda":
-            badge_text = f"⚡ {desc}"
-            badge_fg = self.colors["success"]
-            badge_bg = self.colors["success_bg"]
-        else:
-            badge_text = f"💻 {desc}"
-            badge_fg = self.colors["muted"]
-            badge_bg = self.colors["surface"]
+        def worker():
+            try:
+                ffmpeg_ok, ffmpeg_msg = check_ffmpeg_installed()
+                device, fp16, desc = detect_optimal_device(requested_device="auto")
+                self.msg_queue.put(("HARDWARE_CHECKED", (ffmpeg_ok, ffmpeg_msg, device, desc)))
+            except Exception as exc:
+                self.msg_queue.put(("HARDWARE_CHECK_ERR", str(exc)))
 
-        self.lbl_hw_badge.configure(text=badge_text, fg_color=badge_bg, text_color=badge_fg)
-        self._log_system(f"Perangkat Komputasi Aktif: {desc}")
+        threading.Thread(target=worker, daemon=True).start()
 
     def _on_browse_file(self):
         selected_file = filedialog.askopenfilename(
@@ -977,6 +969,34 @@ class TranskriptorApp(ctk.CTk):
                         text=f"Gagal membaca metadata:\n{data}",
                         text_color=self.colors["danger"],
                     )
+
+                elif event == "HARDWARE_CHECKED":
+                    ffmpeg_ok, ffmpeg_msg, device, desc = data
+                    if not ffmpeg_ok:
+                        self._log_system(f"PERINGATAN: FFmpeg tidak terdeteksi!\n{ffmpeg_msg}")
+                        messagebox.showwarning("FFmpeg Diperlukan", ffmpeg_msg)
+                    else:
+                        self._log_system("FFmpeg & FFprobe terdeteksi dan siap digunakan.")
+
+                    if device == "cuda":
+                        badge_text = f"⚡ {desc}"
+                        badge_fg = self.colors["success"]
+                        badge_bg = self.colors["success_bg"]
+                    else:
+                        badge_text = f"💻 {desc}"
+                        badge_fg = self.colors["muted"]
+                        badge_bg = self.colors["surface"]
+
+                    self.lbl_hw_badge.configure(text=badge_text, fg_color=badge_bg, text_color=badge_fg)
+                    self._log_system(f"Perangkat Komputasi Aktif: {desc}")
+
+                elif event == "HARDWARE_CHECK_ERR":
+                    self.lbl_hw_badge.configure(
+                        text="Perangkat belum terdeteksi",
+                        fg_color=self.colors["surface"],
+                        text_color=self.colors["warning"],
+                    )
+                    self._log_system(f"Gagal mendeteksi perangkat: {data}")
 
                 elif event == "LOG":
                     self._log_system(data)
