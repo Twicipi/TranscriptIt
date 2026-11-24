@@ -6,7 +6,11 @@ echo ===================================================
 echo     Memulai Whisper Transkriptor Studio GUI...
 echo ===================================================
 
-python app_gui.py
+if exist "%~dp0.venv\Scripts\python.exe" (
+    "%~dp0.venv\Scripts\python.exe" app_gui.py
+) else (
+    python app_gui.py
+)
 
 if %ERRORLEVEL% NEQ 0 (
     echo.
