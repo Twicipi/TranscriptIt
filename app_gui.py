@@ -30,6 +30,7 @@ from transcriber import (
     AVAILABLE_MODELS,
     detect_optimal_device,
     load_whisper_model,
+    process_youtube,
     transcribe_media_chunked,
     transcribe_media_gemini,
 )
@@ -37,8 +38,10 @@ from utils import (
     check_ffmpeg_installed,
     export_srt,
     export_txt,
+    extract_video_id,
     format_duration,
     format_file_size,
+    is_youtube_url,
     probe_media_file,
 )
 
@@ -252,6 +255,39 @@ class TranskriptorApp(ctk.CTk):
             command=self._on_browse_file,
         ).grid(row=0, column=1)
 
+        yt_row = ctk.CTkFrame(card, fg_color="transparent")
+        yt_row.grid(row=2, column=0, sticky="ew", padx=14, pady=(8, 0))
+        yt_row.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            yt_row,
+            text="Atau URL YouTube",
+            font=("Segoe UI", 10, "bold"),
+            text_color=self.colors["muted"],
+        ).grid(row=0, column=0, sticky="w", pady=(0, 5))
+
+        self.ent_youtube_url = ctk.CTkEntry(
+            yt_row,
+            placeholder_text="https://www.youtube.com/watch?v=...",
+            fg_color=self.colors["surface"],
+            border_color=self.colors["border"],
+            text_color=self.colors["fg"],
+            height=36,
+        )
+        self.ent_youtube_url.grid(row=1, column=0, sticky="ew")
+
+        self.var_use_whisper_yt = ctk.BooleanVar(value=False)
+        self.chk_use_whisper_yt = ctk.CTkCheckBox(
+            yt_row,
+            text="Gunakan Whisper Lokal (Abaikan CC)",
+            variable=self.var_use_whisper_yt,
+            font=("Segoe UI", 11),
+            text_color=self.colors["fg"],
+            fg_color=self.colors["accent"],
+            border_color=self.colors["border_strong"],
+        )
+        self.chk_use_whisper_yt.grid(row=2, column=0, sticky="w", pady=(6, 0))
+
         self.lbl_media_meta = ctk.CTkLabel(
             card,
             text="Belum ada media yang dipilih",
@@ -264,10 +300,10 @@ class TranskriptorApp(ctk.CTk):
             padx=12,
             pady=10,
         )
-        self.lbl_media_meta.grid(row=2, column=0, sticky="ew", padx=14, pady=(8, 8))
+        self.lbl_media_meta.grid(row=3, column=0, sticky="ew", padx=14, pady=(8, 8))
 
         out_row = ctk.CTkFrame(card, fg_color="transparent")
-        out_row.grid(row=3, column=0, sticky="ew", padx=14, pady=(0, 12))
+        out_row.grid(row=4, column=0, sticky="ew", padx=14, pady=(0, 12))
         out_row.grid_columnconfigure(0, weight=1)
 
         ctk.CTkLabel(
@@ -782,22 +818,42 @@ class TranskriptorApp(ctk.CTk):
             self.ent_output_dir.insert(0, str(Path(selected_dir).resolve()))
 
     def _on_start_transcription(self):
+        yt_url_str = self.ent_youtube_url.get().strip()
         file_str = self.ent_file.get().strip()
-        if not file_str:
-            messagebox.showerror("Error", "Silakan pilih file media audio/video terlebih dahulu!")
-            return
-
-        file_path = Path(file_str).resolve()
-        if not file_path.is_file():
-            messagebox.showerror("Error", f"File tidak ditemukan:\n{file_path}")
-            return
-
         output_dir_str = self.ent_output_dir.get().strip()
-        out_dir = Path(output_dir_str).resolve() if output_dir_str else file_path.parent
+
+        is_yt = bool(yt_url_str)
+        file_path: Optional[Path] = None
+        video_id: Optional[str] = None
+
+        if is_yt:
+            if not is_youtube_url(yt_url_str):
+                messagebox.showerror(
+                    "Error",
+                    "URL YouTube tidak valid!\nGunakan tautan youtube.com atau youtu.be yang valid.",
+                )
+                return
+            video_id = extract_video_id(yt_url_str)
+            out_dir = Path(output_dir_str).resolve() if output_dir_str else (APP_DIR / "output")
+            stem = f"youtube_{video_id}"
+            source_name = f"YouTube ({video_id})"
+        else:
+            if not file_str:
+                messagebox.showerror("Error", "Silakan pilih file media audio/video atau masukkan URL YouTube terlebih dahulu!")
+                return
+
+            file_path = Path(file_str).resolve()
+            if not file_path.is_file():
+                messagebox.showerror("Error", f"File tidak ditemukan:\n{file_path}")
+                return
+
+            out_dir = Path(output_dir_str).resolve() if output_dir_str else file_path.parent
+            stem = file_path.stem
+            source_name = file_path.name
+
         out_dir.mkdir(parents=True, exist_ok=True)
         self.last_output_dir = out_dir
 
-        stem = file_path.stem
         self.last_txt_path = out_dir / f"{stem}.txt"
         self.last_srt_path = out_dir / f"{stem}.srt"
 
@@ -808,6 +864,11 @@ class TranskriptorApp(ctk.CTk):
             lang_code = raw_lang.strip()
 
         params = {
+            "is_youtube": is_yt,
+            "youtube_url": yt_url_str if is_yt else None,
+            "use_whisper": self.var_use_whisper_yt.get() if is_yt else False,
+            "video_id": video_id,
+            "source_name": source_name,
             "file_path": file_path,
             "output_dir": out_dir,
             "txt_path": self.last_txt_path,
@@ -840,8 +901,13 @@ class TranskriptorApp(ctk.CTk):
         self.empty_state.place_forget()
         self.txt_transcript.lift()
 
-        self._log_system(f"Memulai sesi transkripsi untuk '{file_path.name}'...")
-        self._log_system(f"Model: {params['model_name']} | Bahasa: {params['language']} | Device: {params['device']}")
+        if is_yt:
+            mode_yt = "Whisper Lokal (Abaikan CC)" if params["use_whisper"] else "Hybrid (CC -> Fallback Whisper)"
+            self._log_system(f"Memulai sesi transkripsi YouTube: {yt_url_str}")
+            self._log_system(f"Mode: {mode_yt} | Model: {params['model_name']} | Bahasa: {params['language']}")
+        else:
+            self._log_system(f"Memulai sesi transkripsi untuk '{source_name}'...")
+            self._log_system(f"Model: {params['model_name']} | Bahasa: {params['language']} | Device: {params['device']}")
 
         self.transcribe_thread = threading.Thread(target=self._run_transcription, args=(params,), daemon=True)
         self.transcribe_thread.start()
@@ -857,14 +923,81 @@ class TranskriptorApp(ctk.CTk):
             self.btn_stop.configure(state="disabled")
 
     def _run_transcription(self, params: Dict[str, Any]):
-        file_path: Path = params["file_path"]
+        file_path: Optional[Path] = params["file_path"]
+        source_name: str = params["source_name"]
         txt_path: Path = params["txt_path"]
         srt_path: Path = params["srt_path"]
         model_name: str = params["model_name"]
         device_req: str = params["device"]
         chunk_min: int = params["chunk_size_min"]
 
+        def stop_check() -> bool:
+            return self.stop_requested
+
+        def on_progress(msg: str):
+            self.msg_queue.put(("LOG", msg))
+            self.msg_queue.put(("STATUS", msg))
+
+        def on_chunk_start(idx: int, total: int, time_range: str):
+            pct = int(((idx - 1) / total) * 100)
+            self.msg_queue.put(("CHUNK_START", (idx, total, time_range, pct)))
+
+        def on_segment(seg: Dict[str, Any]):
+            self.msg_queue.put(("SEGMENT", seg))
+
+        def on_chunk_completed(idx: int, total: int, all_segs: List[Dict[str, Any]], full_txt: str):
+            export_txt(
+                text=full_txt,
+                segments=all_segs,
+                output_path=txt_path,
+                include_timestamps=True,
+                file_name=source_name,
+                duration_str=params["duration_str"],
+            )
+            export_srt(segments=all_segs, output_path=srt_path)
+            pct = int((idx / total) * 100)
+            self.msg_queue.put(("CHUNK_DONE", (idx, total, pct, txt_path, srt_path)))
+
         try:
+            if params.get("is_youtube"):
+                result = process_youtube(
+                    url=params["youtube_url"],
+                    use_whisper=params["use_whisper"],
+                    model_name=model_name,
+                    language=params["language"],
+                    task=params["task"],
+                    device=device_req,
+                    force_fp32=params["force_fp32"],
+                    chunk_size_sec=float(chunk_min * 60),
+                    initial_prompt=params["initial_prompt"],
+                    progress_callback=on_progress,
+                    on_chunk_completed=on_chunk_completed,
+                    on_segment=on_segment,
+                    on_chunk_start=on_chunk_start,
+                    stop_check=stop_check,
+                )
+
+                if result.get("source") == "youtube_cc":
+                    all_segs = result.get("segments", [])
+                    full_txt = result.get("text", "")
+                    export_txt(
+                        text=full_txt,
+                        segments=all_segs,
+                        output_path=txt_path,
+                        include_timestamps=True,
+                        file_name=source_name,
+                        duration_str=result.get("duration_str", "Tidak diketahui"),
+                    )
+                    export_srt(segments=all_segs, output_path=srt_path)
+                    self.msg_queue.put(("CHUNK_DONE", (1, 1, 100, txt_path, srt_path)))
+
+                if self.stop_requested:
+                    self.msg_queue.put(("FINISHED_STOPPED", (txt_path, srt_path)))
+                else:
+                    self.msg_queue.put(("FINISHED_SUCCESS", (txt_path, srt_path, result.get("language", "id"))))
+                return
+
+            assert file_path is not None
             if model_name == "gemini-4-hydrogen":
                 self.msg_queue.put(("STATUS", "Mengunggah media ke Google Gemini..."))
                 result = transcribe_media_gemini(
@@ -900,29 +1033,6 @@ class TranskriptorApp(ctk.CTk):
             self.msg_queue.put(("LOG", f"Model Whisper '{model_name}' siap dalam {load_elapsed:.2f} detik."))
 
             self.msg_queue.put(("STATUS", "Memulai transkripsi media..."))
-
-            def stop_check() -> bool:
-                return self.stop_requested
-
-            def on_chunk_start(idx: int, total: int, time_range: str):
-                pct = int(((idx - 1) / total) * 100)
-                self.msg_queue.put(("CHUNK_START", (idx, total, time_range, pct)))
-
-            def on_segment(seg: Dict[str, Any]):
-                self.msg_queue.put(("SEGMENT", seg))
-
-            def on_chunk_completed(idx: int, total: int, all_segs: List[Dict[str, Any]], full_txt: str):
-                export_txt(
-                    text=full_txt,
-                    segments=all_segs,
-                    output_path=txt_path,
-                    include_timestamps=True,
-                    file_name=file_path.name,
-                    duration_str=params["duration_str"],
-                )
-                export_srt(segments=all_segs, output_path=srt_path)
-                pct = int((idx / total) * 100)
-                self.msg_queue.put(("CHUNK_DONE", (idx, total, pct, txt_path, srt_path)))
 
             result = transcribe_media_chunked(
                 model=model,

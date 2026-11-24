@@ -1,25 +1,36 @@
 """
 Module: transcriber.py
-Deskripsi: Engine transkripsi berbasis faster-whisper (CTranslate2) dengan deteksi hardware
-           pintar (CUDA/CPU, int8_float16/int8), mitigasi memory error, Smart Chunking
-           dengan overlap 2 detik, VAD filter, dan word-level timestamps untuk output
-           subtitle setara kualitas YouTube.
+Deskripsi: Layer Service / Business Orchestrator (MVC).
+           Mengorkestrasi engine faster-whisper (CTranslate2), Gemini native audio,
+           dan pipeline hybrid YouTube (CC YouTube -> fallback yt-dlp + Whisper).
+
+Catatan Arsitektur:
+  - Bebas dari print(), input(), sys.exit(), maupun referensi widget GUI.
+  - Seluruh pelaporan status disuntikkan melalui progress_callback (DIP).
 """
 
 import gc
 import math
 import mimetypes
 import os
+import shutil
 import site
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from utils import Colors, format_duration, format_file_size, print_info, print_warning
+from utils import (
+    download_youtube_audio,
+    extract_video_id,
+    fetch_youtube_transcript,
+    format_duration,
+    probe_media_file,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -35,25 +46,31 @@ AVAILABLE_MODELS = [
     "turbo",
 ]
 
-# Estimasi kebutuhan VRAM (GB) — digunakan untuk advisory warning
 MODEL_VRAM_ESTIMATES: Dict[str, float] = {
-    "tiny":           1.0,
-    "base":           1.0,
-    "small":          2.0,
-    "medium":         5.0,
-    "large":          10.0,
-    "large-v1":       10.0,
-    "large-v2":       10.0,
-    "large-v3":       10.0,
+    "tiny": 1.0,
+    "base": 1.0,
+    "small": 2.0,
+    "medium": 5.0,
+    "large": 10.0,
+    "large-v1": 10.0,
+    "large-v2": 10.0,
+    "large-v3": 10.0,
     "large-v3-turbo": 4.0,
-    "turbo":          4.0,
+    "turbo": 4.0,
 }
 
-# Overlap antar-chunk (detik) untuk mencegah kata terpotong di batas chunk
 CHUNK_OVERLAP_SEC: float = 2.0
-
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-4-hydrogen")
 CUDA_DLL_HANDLES: List[Any] = []
+
+
+def _notify(callback: Optional[Callable[[str], None]], message: str) -> None:
+    """Helper internal untuk meneruskan pesan status ke callback jika tersedia."""
+    if callback:
+        try:
+            callback(message)
+        except Exception:
+            pass
 
 
 def configure_cuda_runtime() -> None:
@@ -81,17 +98,16 @@ def configure_cuda_runtime() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 1. DETEKSI HARDWARE
+# 1. DETEKSI HARDWARE & ADVISORY VRAM
 # ---------------------------------------------------------------------------
 
 def detect_optimal_device(
     requested_device: str = "auto",
-    force_fp32: bool = False
+    force_fp32: bool = False,
+    progress_callback: Optional[Callable[[str], None]] = None,
 ) -> Tuple[str, bool, str]:
     """
     Mendeteksi hardware akselerasi (GPU CUDA vs CPU) dan menentukan flag FP16.
-    Returns:
-        (device_str, use_fp16, description_str)
     """
     requested = requested_device.lower().strip()
 
@@ -121,9 +137,9 @@ def detect_optimal_device(
         pass
 
     if requested == "cuda" and not cuda_available:
-        print_warning(
-            "Perangkat 'cuda' diminta namun GPU NVIDIA / CUDA tidak terdeteksi. "
-            "Beralih secara otomatis ke mode CPU."
+        _notify(
+            progress_callback,
+            "Peringatan: Perangkat 'cuda' diminta namun GPU NVIDIA tidak terdeteksi. Beralih ke CPU.",
         )
         return "cpu", False, "CPU (Fallback karena CUDA tidak tersedia)"
 
@@ -133,16 +149,15 @@ def detect_optimal_device(
         mode_fp = "FP16" if fp16 else "FP32 (Forced)"
         desc = f"NVIDIA GPU: {gpu_name} ({vram_text}) [{mode_fp}]"
         return device, fp16, desc
-    else:
-        return "cpu", False, "CPU Standard (CUDA tidak terdeteksi)"
+    return "cpu", False, "CPU Standard (CUDA tidak terdeteksi)"
 
 
-# ---------------------------------------------------------------------------
-# 2. ADVISORY VRAM
-# ---------------------------------------------------------------------------
-
-def check_vram_advisory(model_name: str, device: str) -> None:
-    """Peringatan dini jika model melebihi kapasitas VRAM GPU."""
+def check_vram_advisory(
+    model_name: str,
+    device: str,
+    progress_callback: Optional[Callable[[str], None]] = None,
+) -> None:
+    """Peringatan dini jika model berpotensi melebihi kapasitas VRAM GPU."""
     if device != "cuda":
         return
     try:
@@ -152,27 +167,21 @@ def check_vram_advisory(model_name: str, device: str) -> None:
         total_vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
 
         if required_vram > total_vram_gb:
-            print_warning(
-                f"Model '{model_name}' diperkirakan membutuhkan ~{required_vram:.1f} GB VRAM, "
-                f"sedangkan kapasitas GPU Anda adalah {total_vram_gb:.1f} GB.\n"
-                f"   💡 Jika terjadi 'CUDA OutOfMemory', gunakan model yang lebih ringan "
-                f"seperti '--model small', '--model large-v3-turbo', atau tambahkan '--device cpu'."
+            _notify(
+                progress_callback,
+                f"Peringatan VRAM: Model '{model_name}' butuh ~{required_vram:.1f} GB VRAM, "
+                f"kapasitas GPU {total_vram_gb:.1f} GB. Gunakan 'small'/'large-v3-turbo' atau '--device cpu' jika OOM.",
             )
     except Exception:
         pass
 
 
 # ---------------------------------------------------------------------------
-# 3. LOAD MODEL (faster-whisper)
+# 2. LOAD MODEL (faster-whisper)
 # ---------------------------------------------------------------------------
 
 def select_optimal_compute_type(device: str = "cpu", force_fp32: bool = False) -> str:
-    """
-    Memilih compute_type terbaik yang benar-benar didukung oleh arsitektur GPU/CPU saat ini.
-    - RTX 20/30/40, GTX 16xx (Turing/Ampere/Ada) : int8_float16
-    - GTX 1050/1060/1070/1080 (Pascal)          : int8_float32 / int8
-    - CPU                                       : int8
-    """
+    """Memilih compute_type terbaik yang didukung arsitektur GPU/CPU."""
     if force_fp32:
         return "float32"
 
@@ -188,11 +197,11 @@ def select_optimal_compute_type(device: str = "cpu", force_fp32: bool = False) -
             if ct in supported:
                 return ct
         return "float32"
-    else:
-        for ct in ["int8", "int8_float32", "float32"]:
-            if ct in supported:
-                return ct
-        return "int8"
+
+    for ct in ["int8", "int8_float32", "float32"]:
+        if ct in supported:
+            return ct
+    return "int8"
 
 
 def load_whisper_model(
@@ -200,35 +209,29 @@ def load_whisper_model(
     device: str = "cpu",
     force_fp32: bool = False,
     download_root: Optional[str] = None,
+    progress_callback: Optional[Callable[[str], None]] = None,
 ) -> Any:
-    """
-    Memuat model faster-whisper ke perangkat yang ditargetkan dengan pemilihan
-    compute_type otomatis yang kompatibel dengan GPU/CPU.
-    """
+    """Memuat model faster-whisper ke perangkat target."""
     try:
         from faster_whisper import WhisperModel
-    except ImportError:
+    except ImportError as exc:
         raise ImportError(
-            "Library 'faster-whisper' belum terpasang!\n"
-            "Silakan install: pip install faster-whisper>=1.1.0"
-        )
+            "Library 'faster-whisper' belum terpasang! Jalankan: pip install faster-whisper>=1.1.0"
+        ) from exc
 
     clean_model = model_name.lower().strip()
     if clean_model not in AVAILABLE_MODELS and not Path(clean_model).exists():
-        print_warning(
-            f"Nama model '{model_name}' tidak ada di daftar resmi {AVAILABLE_MODELS}. "
-            "Mencoba memuat langsung..."
+        _notify(
+            progress_callback,
+            f"Peringatan: Nama model '{model_name}' tidak ada di daftar standar, mencoba memuat langsung...",
         )
 
-    check_vram_advisory(clean_model, device)
-
-    # Tentukan compute_type secara otomatis berdasarkan dukungan perangkat
+    check_vram_advisory(clean_model, device, progress_callback=progress_callback)
     compute_type = select_optimal_compute_type(device=device, force_fp32=force_fp32)
 
-    print_info(
-        "Model Loading",
-        f"Memuat faster-whisper '{clean_model}' ke {device.upper()} "
-        f"[compute_type={compute_type}]..."
+    _notify(
+        progress_callback,
+        f"Memuat faster-whisper '{clean_model}' ke {device.upper()} [compute_type={compute_type}]...",
     )
     start_time = time.time()
 
@@ -244,7 +247,7 @@ def load_whisper_model(
     except ValueError as e:
         err_msg = str(e).lower()
         if "compute type" in err_msg and device == "cuda":
-            print_warning(f"Compute type '{compute_type}' ditolak GPU. Mencoba fallback kompatibel...")
+            _notify(progress_callback, f"Compute type '{compute_type}' ditolak GPU, mencoba fallback...")
             for fallback_ct in ["int8_float32", "int8", "float32"]:
                 if fallback_ct == compute_type:
                     continue
@@ -252,7 +255,7 @@ def load_whisper_model(
                     kwargs["compute_type"] = fallback_ct
                     model = WhisperModel(clean_model, **kwargs)
                     compute_type = fallback_ct
-                    print_info("Fallback Sukses", f"Berhasil memuat model dengan compute_type={compute_type}")
+                    _notify(progress_callback, f"Fallback sukses dengan compute_type={compute_type}.")
                     break
                 except Exception:
                     continue
@@ -262,9 +265,13 @@ def load_whisper_model(
             raise e
 
     elapsed = time.time() - start_time
-    print_info("Model Ready", f"Model siap dalam {elapsed:.2f} detik.\n")
+    _notify(progress_callback, f"Model siap dalam {elapsed:.2f} detik.")
     return model
 
+
+# ---------------------------------------------------------------------------
+# 3. GEMINI NATIVE AUDIO TRANSCRIPTION
+# ---------------------------------------------------------------------------
 
 def transcribe_media_gemini(
     file_path: Path,
@@ -360,7 +367,7 @@ def transcribe_media_gemini(
 
 
 # ---------------------------------------------------------------------------
-# 4. EKSTRAKSI AUDIO CHUNK (dengan audio filter)
+# 4. EKSTRAKSI AUDIO CHUNK
 # ---------------------------------------------------------------------------
 
 def extract_audio_chunk(
@@ -370,10 +377,8 @@ def extract_audio_chunk(
     sample_rate: int = 16000,
 ) -> np.ndarray:
     """
-    Mengekstrak potongan audio spesifik dari file media via FFmpeg subprocess.
-    - Hemat RAM: tidak memuat keseluruhan file ke memori.
-    - Filter audio: highpass 80 Hz (hilangkan dengung rendah) + dynaudnorm
-      (normalisasi dinamis agar vokal lebih jelas dan konsisten).
+    Mengekstrak potongan audio spesifik dari file media via FFmpeg subprocess
+    dengan highpass 80Hz + dynaudnorm menuju PCM 16-bit 16kHz mono.
     """
     cmd = [
         "ffmpeg",
@@ -382,19 +387,17 @@ def extract_audio_chunk(
         "-ss", str(start_sec),
         "-t", str(duration_sec),
         "-i", str(media_path),
-        # Filter audio ringan: hapus dengung frekuensi rendah + normalisasi vokal
         "-af", "highpass=f=80,dynaudnorm=f=150:g=15",
         "-f", "s16le",
         "-ac", "1",
         "-acodec", "pcm_s16le",
         "-ar", str(sample_rate),
-        "-"
+        "-",
     ]
     proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if proc.returncode != 0 and len(proc.stdout) == 0:
         return np.array([], dtype=np.float32)
 
-    # Konversi raw PCM 16-bit ke float32 [-1.0, 1.0]
     return np.frombuffer(proc.stdout, np.int16).flatten().astype(np.float32) / 32768.0
 
 
@@ -410,50 +413,40 @@ def transcribe_media_chunked(
     language: Optional[str] = "id",
     task: str = "transcribe",
     verbose: bool = True,
-    fp16: bool = True,                # Dipertahankan untuk kompatibilitas signature CLI/GUI
+    fp16: bool = True,
     initial_prompt: Optional[str] = None,
     on_chunk_completed: Optional[Callable[[int, int, List[Dict[str, Any]], str], None]] = None,
     on_segment: Optional[Callable[[Dict[str, Any]], None]] = None,
     on_chunk_start: Optional[Callable[[int, int, str], None]] = None,
     stop_check: Optional[Callable[[], bool]] = None,
+    progress_callback: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, Any]:
     """
-    Transkripsi Smart Chunking dengan:
-      - Overlap 2 detik antar chunk untuk mencegah kata terpotong.
-      - Deduplication berbasis 'last_committed_end' agar segmen tidak dobel.
-      - VAD filter aktif (min_silence_duration_ms=500, speech_pad_ms=250).
-      - Word-level timestamps (word, start, end, probability) di tiap segmen.
-      - initial_prompt murni dari pengguna (tidak di-chain ke chunk berikutnya).
-      - condition_on_previous_text=False untuk mencegah hallucination drift.
+    Orkestrasi transkripsi Smart Chunking + Overlap 2 detik, VAD filter,
+    dan word-level timestamps.
     """
     if not file_path.is_file():
         raise FileNotFoundError(f"File media tidak ditemukan: {file_path}")
 
-    # Normalisasi bahasa
     lang_param: Optional[str] = (
         None if (language is None or language.lower() in ["auto", "none", ""])
         else language.lower()
     )
 
     if total_duration is None or total_duration <= 0:
-        total_duration = 36000.0  # Fallback 10 jam
+        total_duration = 36000.0
 
     total_chunks = max(1, math.ceil(total_duration / chunk_size_sec))
     all_segments: List[Dict[str, Any]] = []
     full_text_list: List[str] = []
     detected_language: str = lang_param or "id"
-
-    # Batas timestamp global segmen terakhir yang sudah dikonfirmasi (untuk dedup overlap)
     last_committed_end: float = 0.0
 
-    print(
-        f"{Colors.CYAN}🧩 Memulai transkripsi dengan Smart Chunking + Overlap "
-        f"({total_chunks} bagian @ {int(chunk_size_sec // 60)} menit, "
-        f"overlap {CHUNK_OVERLAP_SEC:.0f}s, VAD aktif)...{Colors.RESET}"
+    _notify(
+        progress_callback,
+        f"Memulai transkripsi Smart Chunking ({total_chunks} bagian @ {int(chunk_size_sec // 60)} menit, overlap {CHUNK_OVERLAP_SEC:.0f}s, VAD aktif)...",
     )
-    sys.stdout.flush()
 
-    # VAD parameters (Silero VAD via faster-whisper)
     vad_params: Dict[str, Any] = {
         "min_silence_duration_ms": 500,
         "speech_pad_ms": 250,
@@ -461,10 +454,9 @@ def transcribe_media_chunked(
 
     for chunk_idx in range(total_chunks):
         if stop_check and stop_check():
-            print(f"{Colors.YELLOW}⚠️ Transkripsi dihentikan atas permintaan pengguna.{Colors.RESET}")
+            _notify(progress_callback, "Transkripsi dihentikan atas permintaan pengguna.")
             break
 
-        # Hitung rentang chunk dengan overlap
         chunk_start = chunk_idx * chunk_size_sec
         chunk_start_with_overlap = max(0.0, chunk_start - CHUNK_OVERLAP_SEC) if chunk_idx > 0 else 0.0
         chunk_end = min(chunk_start + chunk_size_sec, total_duration)
@@ -473,14 +465,11 @@ def transcribe_media_chunked(
         if dur_sec <= 0.1:
             break
 
-        # Rentang yang ditampilkan ke pengguna (tanpa overlap)
         chunk_time_str = f"{format_duration(chunk_start)} - {format_duration(chunk_end)}"
-        print(
-            f"\n{Colors.BLUE}{Colors.BOLD}▶ [{chunk_idx + 1}/{total_chunks}]{Colors.RESET} "
-            f"Memproses rentang {Colors.BOLD}{chunk_time_str}{Colors.RESET} "
-            f"(extract: {format_duration(chunk_start_with_overlap)} - {format_duration(chunk_end)})..."
+        _notify(
+            progress_callback,
+            f"[{chunk_idx + 1}/{total_chunks}] Memproses rentang {chunk_time_str}...",
         )
-        sys.stdout.flush()
 
         if on_chunk_start:
             try:
@@ -488,13 +477,11 @@ def transcribe_media_chunked(
             except Exception:
                 pass
 
-        # Ekstrak audio chunk (dengan overlap di sisi kiri)
         chunk_audio = extract_audio_chunk(file_path, chunk_start_with_overlap, dur_sec)
         if len(chunk_audio) == 0:
-            print_warning(f"Audio chunk {chunk_idx + 1} kosong atau mencapai akhir file.")
+            _notify(progress_callback, f"Audio chunk {chunk_idx + 1} kosong atau mencapai akhir file.")
             break
 
-        # ---- faster-whisper transcribe ----
         try:
             segments_iter, info = model.transcribe(
                 chunk_audio,
@@ -507,7 +494,6 @@ def transcribe_media_chunked(
                 vad_filter=True,
                 vad_parameters=vad_params,
             )
-            # Materialize generator sebelum gc
             raw_segments = list(segments_iter)
         except Exception as e:
             err_str = str(e).lower()
@@ -520,52 +506,42 @@ def transcribe_media_chunked(
                     pass
                 gc.collect()
                 raise RuntimeError(
-                    f"\n[CUDA OUT OF MEMORY] Memori GPU tidak cukup pada bagian {chunk_idx + 1}. "
+                    f"[CUDA OUT OF MEMORY] Memori GPU tidak cukup pada bagian {chunk_idx + 1}. "
                     f"Gunakan model lebih kecil atau '--device cpu'."
                 ) from e
             raise
 
-        # Update bahasa terdeteksi
         if info and hasattr(info, "language") and info.language:
             detected_language = info.language
 
         chunk_text_parts: List[str] = []
 
         for seg in raw_segments:
-            # Global offset timestamp (relatif terhadap keseluruhan media)
             global_start = seg.start + chunk_start_with_overlap
             global_end = seg.end + chunk_start_with_overlap
 
-            # --- Deduplication overlap ---
-            # Lewati segmen yang seluruhnya berada di dalam zona overlap yang sudah
-            # diproses oleh chunk sebelumnya.
             if global_end <= last_committed_end:
                 continue
-            # Jika awal segmen tumpang tindih tapi akhirnya baru: geser awal ke
-            # last_committed_end agar tidak ada celah maupun duplikasi.
             if global_start < last_committed_end:
                 global_start = last_committed_end
 
-            # Susun data words dengan offset global
             words_data: List[Dict[str, Any]] = []
             if seg.words:
                 for w in seg.words:
                     words_data.append({
-                        "word":        w.word,
-                        "start":       round(w.start + chunk_start_with_overlap, 3),
-                        "end":         round(w.end   + chunk_start_with_overlap, 3),
+                        "word": w.word,
+                        "start": round(w.start + chunk_start_with_overlap, 3),
+                        "end": round(w.end + chunk_start_with_overlap, 3),
                         "probability": round(w.probability, 4),
                     })
 
             seg_text = seg.text.strip()
-
-            # Buat dictionary segmen seragam (kompatibel dengan CLI & GUI)
             seg_dict: Dict[str, Any] = {
-                "id":          len(all_segments),
-                "start":       round(global_start, 3),
-                "end":         round(global_end, 3),
-                "text":        seg_text,
-                "words":       words_data,
+                "id": len(all_segments),
+                "start": round(global_start, 3),
+                "end": round(global_end, 3),
+                "text": seg_text,
+                "words": words_data,
                 "avg_logprob": getattr(seg, "avg_logprob", 0.0),
                 "no_speech_prob": getattr(seg, "no_speech_prob", 0.0),
             }
@@ -576,40 +552,165 @@ def transcribe_media_chunked(
             if seg_text:
                 chunk_text_parts.append(seg_text)
 
-            # Callback real-time ke GUI / consumer
             if on_segment:
                 try:
                     on_segment(seg_dict)
                 except Exception:
                     pass
 
-            if verbose:
-                t_start = format_duration(seg_dict["start"])
-                t_end = format_duration(seg_dict["end"])
-                print(
-                    f"  {Colors.DIM}[{t_start} --> {t_end}]{Colors.RESET} "
-                    f"{seg_text}"
-                )
-                sys.stdout.flush()
-
         if chunk_text_parts:
             full_text_list.extend(chunk_text_parts)
 
-        # Autosave per chunk
         current_full_text = " ".join(full_text_list)
         if on_chunk_completed:
             try:
                 on_chunk_completed(chunk_idx + 1, total_chunks, all_segments, current_full_text)
             except Exception as save_err:
-                print_warning(f"Peringatan saat autosave progress: {save_err}")
+                _notify(progress_callback, f"Peringatan autosave: {save_err}")
 
-        # Bersihkan memori
         del chunk_audio
         del raw_segments
         gc.collect()
 
     return {
-        "text":     " ".join(full_text_list),
+        "text": " ".join(full_text_list),
         "segments": all_segments,
         "language": detected_language,
     }
+
+
+# ---------------------------------------------------------------------------
+# 6. PIPELINE HYBRID YOUTUBE (Jalur 1: CC -> Jalur 2: yt-dlp + Whisper)
+# ---------------------------------------------------------------------------
+
+def _is_missing_transcript_error(exc: Exception) -> bool:
+    """Mendeteksi exception ketidaktersediaan CC/subtitle dari youtube-transcript-api."""
+    name = type(exc).__name__
+    if name in ("TranscriptsDisabled", "NoTranscriptFound", "VideoUnavailable", "CouldNotRetrieveTranscript"):
+        return True
+    msg = str(exc).lower()
+    return any(
+        marker in msg
+        for marker in ("transcripts are disabled", "no transcripts were found", "could not retrieve a transcript")
+    )
+
+
+def process_youtube(
+    url: str,
+    use_whisper: bool = False,
+    model_name: str = "base",
+    language: Optional[str] = "id",
+    task: str = "transcribe",
+    device: str = "auto",
+    force_fp32: bool = False,
+    chunk_size_sec: float = 600.0,
+    initial_prompt: Optional[str] = None,
+    progress_callback: Optional[Callable[[str], None]] = None,
+    on_chunk_completed: Optional[Callable[[int, int, List[Dict[str, Any]], str], None]] = None,
+    on_segment: Optional[Callable[[Dict[str, Any]], None]] = None,
+    on_chunk_start: Optional[Callable[[int, int, str], None]] = None,
+    stop_check: Optional[Callable[[], bool]] = None,
+) -> Dict[str, Any]:
+    """
+    Orkestrasi transkripsi YouTube Hybrid 2 Jalur:
+      - Jalur 1 (Default): Ambil CC/subtitle bawaan via youtube-transcript-api.
+      - Jalur 2 (Fallback / use_whisper=True): Unduh audio terbaik via yt-dlp ke
+        direktori temporary, jalankan pipeline Whisper lokal, lalu bersihkan file temp.
+    """
+    video_id = extract_video_id(url)
+
+    # Susun prioritas bahasa untuk CC YouTube
+    cc_languages: List[str] = []
+    if language and language.lower() not in ("auto", "none", ""):
+        cc_languages.append(language.lower())
+    for fallback_lang in ("id", "en"):
+        if fallback_lang not in cc_languages:
+            cc_languages.append(fallback_lang)
+
+    # ---- JALUR 1: YouTube CC ----
+    if not use_whisper and task != "translate":
+        _notify(progress_callback, f"Jalur 1: Mengambil CC/subtitle YouTube untuk video '{video_id}'...")
+        try:
+            segments = fetch_youtube_transcript(video_id, languages=cc_languages)
+            if segments:
+                for seg in segments:
+                    if on_segment:
+                        try:
+                            on_segment(seg)
+                        except Exception:
+                            pass
+                full_text = " ".join(seg["text"] for seg in segments if seg.get("text"))
+                _notify(
+                    progress_callback,
+                    f"Jalur 1 berhasil: {len(segments)} segmen CC YouTube diambil.",
+                )
+                return {
+                    "text": full_text,
+                    "segments": segments,
+                    "language": cc_languages[0] if cc_languages else "auto",
+                    "source": "youtube_cc",
+                    "video_id": video_id,
+                    "duration_str": format_duration(segments[-1]["end"]) if segments else "Tidak diketahui",
+                }
+            _notify(progress_callback, "CC YouTube kosong. Beralih ke Jalur 2 (yt-dlp + Whisper)...")
+        except Exception as exc:
+            if _is_missing_transcript_error(exc):
+                _notify(
+                    progress_callback,
+                    f"CC YouTube tidak tersedia ({type(exc).__name__}). Beralih ke Jalur 2 (yt-dlp + Whisper)...",
+                )
+            else:
+                _notify(
+                    progress_callback,
+                    f"Gagal mengambil CC YouTube ({exc}). Beralih ke Jalur 2 (yt-dlp + Whisper)...",
+                )
+    elif use_whisper:
+        _notify(progress_callback, "Mode Force Whisper aktif. Melewati Jalur 1, langsung ke Jalur 2 (yt-dlp + Whisper)...")
+    elif task == "translate":
+        _notify(progress_callback, "Mode translate aktif. Menggunakan Jalur 2 (yt-dlp + Whisper)...")
+
+    # ---- JALUR 2: Download Audio via yt-dlp + Whisper ----
+    temp_dir = tempfile.mkdtemp(prefix="transkriptor_yt_")
+    try:
+        _notify(progress_callback, f"Jalur 2: Mengunduh trek audio terbaik YouTube ({video_id})...")
+        audio_path = Path(download_youtube_audio(url, temp_dir))
+
+        media_info = probe_media_file(audio_path)
+        total_duration = media_info.get("duration") or 0.0
+
+        target_device, fp16, device_desc = detect_optimal_device(
+            requested_device=device,
+            force_fp32=force_fp32,
+            progress_callback=progress_callback,
+        )
+        _notify(progress_callback, f"Perangkat aktif: {device_desc}")
+
+        model = load_whisper_model(
+            model_name=model_name,
+            device=target_device,
+            force_fp32=force_fp32,
+            progress_callback=progress_callback,
+        )
+
+        result = transcribe_media_chunked(
+            model=model,
+            file_path=audio_path,
+            total_duration=total_duration,
+            chunk_size_sec=chunk_size_sec,
+            language=language,
+            task=task,
+            verbose=False,
+            fp16=fp16,
+            initial_prompt=initial_prompt,
+            on_chunk_completed=on_chunk_completed,
+            on_segment=on_segment,
+            on_chunk_start=on_chunk_start,
+            stop_check=stop_check,
+            progress_callback=progress_callback,
+        )
+        result["source"] = "youtube_whisper"
+        result["video_id"] = video_id
+        result["duration_str"] = media_info.get("duration_str", "Tidak diketahui")
+        return result
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
