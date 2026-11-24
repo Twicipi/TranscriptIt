@@ -10,6 +10,7 @@ import gc
 import math
 import mimetypes
 import os
+import site
 import subprocess
 import sys
 import time
@@ -52,6 +53,31 @@ MODEL_VRAM_ESTIMATES: Dict[str, float] = {
 CHUNK_OVERLAP_SEC: float = 2.0
 
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+CUDA_DLL_HANDLES: List[Any] = []
+
+
+def configure_cuda_runtime() -> None:
+    """Make pip-installed NVIDIA runtime DLLs visible to Windows loaders."""
+    if os.name != "nt":
+        return
+
+    site_packages = [Path(path) for path in site.getsitepackages()]
+    site_packages.append(Path(sys.prefix) / "Lib" / "site-packages")
+    dll_dirs = {
+        package_dir / "nvidia" / "cublas" / "bin"
+        for package_dir in site_packages
+    }
+    dll_dirs.update(
+        package_dir / "nvidia" / "cudnn" / "bin"
+        for package_dir in site_packages
+    )
+    for dll_dir in dll_dirs:
+        if dll_dir.is_dir():
+            os.environ["PATH"] = f"{dll_dir};{os.environ.get('PATH', '')}"
+            try:
+                CUDA_DLL_HANDLES.append(os.add_dll_directory(str(dll_dir)))
+            except (AttributeError, OSError):
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -151,6 +177,7 @@ def select_optimal_compute_type(device: str = "cpu", force_fp32: bool = False) -
         return "float32"
 
     try:
+        configure_cuda_runtime()
         import ctranslate2
         supported = ctranslate2.get_supported_compute_types(device)
     except Exception:
