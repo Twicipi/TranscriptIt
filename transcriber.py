@@ -67,20 +67,32 @@ def detect_optimal_device(
     Returns:
         (device_str, use_fp16, description_str)
     """
-    try:
-        import torch
-    except ImportError:
-        print_warning(
-            "Library 'torch' belum terpasang. Gunakan 'pip install torch' untuk melanjutkan."
-        )
-        return "cpu", False, "CPU (torch not loaded)"
-
     requested = requested_device.lower().strip()
 
     if requested == "cpu":
         return "cpu", False, "CPU (Dipaksa oleh pengguna)"
 
-    cuda_available = torch.cuda.is_available()
+    cuda_available = False
+    gpu_name = "NVIDIA GPU"
+    vram_text = "VRAM tidak diketahui"
+    try:
+        probe = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=name,memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if probe.returncode == 0 and probe.stdout.strip():
+            gpu_name, vram_mib = [part.strip() for part in probe.stdout.splitlines()[0].split(",", 1)]
+            vram_text = f"{vram_mib} MiB VRAM"
+            cuda_available = True
+    except (OSError, subprocess.SubprocessError, ValueError):
+        pass
 
     if requested == "cuda" and not cuda_available:
         print_warning(
@@ -91,12 +103,9 @@ def detect_optimal_device(
 
     if cuda_available and requested in ["auto", "cuda"]:
         device = "cuda"
-        gpu_name = torch.cuda.get_device_name(0)
-        total_vram = torch.cuda.get_device_properties(0).total_memory
-        vram_str = format_file_size(total_vram)
         fp16 = not force_fp32
         mode_fp = "FP16" if fp16 else "FP32 (Forced)"
-        desc = f"NVIDIA GPU: {gpu_name} ({vram_str} VRAM) [{mode_fp}]"
+        desc = f"NVIDIA GPU: {gpu_name} ({vram_text}) [{mode_fp}]"
         return device, fp16, desc
     else:
         return "cpu", False, "CPU Standard (CUDA tidak terdeteksi)"
